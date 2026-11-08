@@ -913,35 +913,36 @@ pub(super) fn word_table_style_name(id: &str) -> Option<String> {
 /// by its tint and darkened by its shade; `auto` for a colour the theme
 /// does not hold.
 fn with_theme_colours(xml: &str, theme: &str) -> String {
-    xml.split_inclusive('>')
-        .map(|tag| {
-            if !tag.contains("\"@\"") {
-                return tag.to_string();
+    let mut result = String::with_capacity(xml.len());
+    for tag in xml.split_inclusive('>') {
+        if !tag.contains("\"@\"") {
+            result.push_str(tag);
+            continue;
+        }
+        let attribute = |name: &str| {
+            tag.split_once(&format!(" w:{name}=\""))
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(value, _)| value)
+        };
+        let mut out = tag.to_string();
+        for (key, colour, tint, shade) in [
+            ("color", "themeColor", "themeTint", "themeShade"),
+            ("val", "themeColor", "themeTint", "themeShade"),
+            ("fill", "themeFill", "themeFillTint", "themeFillShade"),
+        ] {
+            let unresolved = format!(" w:{key}=\"@\"");
+            if out.contains(&unresolved) {
+                let hex = attribute(colour)
+                    .and_then(|name| {
+                        theme_colour(theme, name, attribute(tint), attribute(shade))
+                    })
+                    .unwrap_or_else(|| "auto".to_string());
+                out = out.replace(&unresolved, &format!(" w:{key}=\"{hex}\""));
             }
-            let attribute = |name: &str| {
-                tag.split_once(&format!(" w:{name}=\""))
-                    .and_then(|(_, rest)| rest.split_once('"'))
-                    .map(|(value, _)| value)
-            };
-            let mut out = tag.to_string();
-            for (key, colour, tint, shade) in [
-                ("color", "themeColor", "themeTint", "themeShade"),
-                ("val", "themeColor", "themeTint", "themeShade"),
-                ("fill", "themeFill", "themeFillTint", "themeFillShade"),
-            ] {
-                let unresolved = format!(" w:{key}=\"@\"");
-                if out.contains(&unresolved) {
-                    let hex = attribute(colour)
-                        .and_then(|name| {
-                            theme_colour(theme, name, attribute(tint), attribute(shade))
-                        })
-                        .unwrap_or_else(|| "auto".to_string());
-                    out = out.replace(&unresolved, &format!(" w:{key}=\"{hex}\""));
-                }
-            }
-            out
-        })
-        .collect()
+        }
+        result.push_str(&out);
+    }
+    result
 }
 
 /// The theme colour `name` (`accent1`, `text1`), tinted and shaded as Word

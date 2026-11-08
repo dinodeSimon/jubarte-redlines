@@ -2885,12 +2885,13 @@ fn with_section_change(section: &str, mark: &FormatMark) -> String {
         return section.to_string();
     }
     // The page alone: a section's headers are no part of its change.
-    let old: String = section[open..close]
-        .split_inclusive("/>")
-        .filter(|element| {
-            !element.contains("<w:headerReference") && !element.contains("<w:footerReference")
-        })
-        .collect();
+    let old_section = &section[open..close];
+    let mut old = String::with_capacity(old_section.len());
+    for element in old_section.split_inclusive("/>") {
+        if !element.contains("<w:headerReference") && !element.contains("<w:footerReference") {
+            old.push_str(element);
+        }
+    }
     format!(
         "{}<w:sectPrChange w:id=\"{}\" w:author=\"{}\"{}><w:sectPr>{old}</w:sectPr></w:sectPrChange>{}",
         &section[..close],
