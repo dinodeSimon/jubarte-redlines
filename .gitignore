@@ -134,3 +134,5 @@ bench-reports/
 .scan/
 # tools/parity/build.sh and parity_check.py write here by default (#1757)
 tools/parity/parity-work/
+.env
+word-openapi.json
