@@ -39,6 +39,7 @@ mod math_font;
 mod math_layout;
 mod metafile;
 mod pdf;
+mod png_pass;
 mod preset_geom;
 mod preset_geom_data;
 mod preset_text_rect_data;
@@ -774,6 +775,9 @@ fn with_layout<T>(
     docx: &[u8],
     emit: impl FnOnce(&Fonts, &[pdf::Page], &LayoutFacts) -> T,
 ) -> Result<T, ConvertError> {
+    // Each picture of this document is decoded once, however many places
+    // (headers of every section, repeated drawings) show it.
+    let _pictures = DecodedPictures::open();
     crate::document_comparer::admit_package(docx)
         .map_err(|err| ConvertError::OpenPackage(err.to_string()))?;
     let normalized = crate::strict_translation::strict_to_transitional_docx(docx)
@@ -3101,16 +3105,19 @@ enum ImageKind {
     Jpeg {
         width: u32,
         height: u32,
-        bytes: Vec<u8>,
+        bytes: pdf::Pixels,
         components: u8,
     },
     Rgb {
         width: u32,
         height: u32,
-        bytes: Vec<u8>,
+        bytes: pdf::Pixels,
         /// PNG alpha, one byte per pixel; PDF `/SMask`.
-        alpha: Option<Vec<u8>>,
+        alpha: Option<pdf::Pixels>,
     },
+    /// An 8-bit PNG without transparency, kept as its file and passed through
+    /// to the PDF undecoded (`png_pass`): only its size is laid out.
+    Png(std::sync::Arc<png_pass::PngPass>),
     /// WMF/EMF/OLE preview: keep the drawing extent in flow even if we
     /// cannot rasterize the bytes (Strict01 cliparts are placeable WMF).
     Reserve,
@@ -21327,37 +21334,18 @@ fn washed_out(kind: ImageKind) -> ImageKind {
         return ImageKind::Metafile { raster, texts };
     }
     let pale = |v: &mut u8| *v = (f32::from(*v) * 0.29 + 206.7).round().min(255.0) as u8;
-    match kind {
-        ImageKind::Jpeg { bytes, .. } => {
-            let Ok(img) = image::load_from_memory(&bytes) else {
-                return ImageKind::Reserve;
-            };
-            let rgb = img.to_rgb8();
-            let (width, height) = (rgb.width(), rgb.height());
-            let mut bytes = rgb.into_raw();
+    match raster_samples(kind) {
+        Ok(Some((width, height, mut bytes, alpha))) => {
             bytes.iter_mut().for_each(pale);
             ImageKind::Rgb {
                 width,
                 height,
-                bytes,
-                alpha: None,
+                bytes: bytes.into(),
+                alpha: alpha.map(Into::into),
             }
         }
-        ImageKind::Rgb {
-            width,
-            height,
-            mut bytes,
-            alpha,
-        } => {
-            bytes.iter_mut().for_each(pale);
-            ImageKind::Rgb {
-                width,
-                height,
-                bytes,
-                alpha,
-            }
-        }
-        other => other,
+        Ok(None) => ImageKind::Reserve,
+        Err(other) => other,
     }
 }
 
@@ -21377,21 +21365,10 @@ fn soften_edges(kind: ImageKind, fx: f32, fy: f32) -> ImageKind {
         let raster = Box::new(soften_edges(*raster, fx, fy));
         return ImageKind::Metafile { raster, texts };
     }
-    let (width, height, bytes, alpha) = match kind {
-        ImageKind::Jpeg { bytes, .. } => {
-            let Ok(img) = image::load_from_memory(&bytes) else {
-                return ImageKind::Reserve;
-            };
-            let rgb = img.to_rgb8();
-            (rgb.width(), rgb.height(), rgb.into_raw(), None)
-        }
-        ImageKind::Rgb {
-            width,
-            height,
-            bytes,
-            alpha,
-        } => (width, height, bytes, alpha),
-        other => return other,
+    let (width, height, bytes, alpha) = match raster_samples(kind) {
+        Ok(Some(samples)) => samples,
+        Ok(None) => return ImageKind::Reserve,
+        Err(other) => return other,
     };
     let (rx, ry) = ((fx * width as f32).max(1.0), (fy * height as f32).max(1.0));
     let mut alpha = alpha.unwrap_or_else(|| vec![255; (width * height) as usize]);
@@ -21407,8 +21384,8 @@ fn soften_edges(kind: ImageKind, fx: f32, fy: f32) -> ImageKind {
     ImageKind::Rgb {
         width,
         height,
-        bytes,
-        alpha: Some(alpha),
+        bytes: bytes.into(),
+        alpha: Some(alpha.into()),
     }
 }
 
@@ -21465,21 +21442,10 @@ fn duotone_image(kind: ImageKind, dom: &Dom, blip: NodeId, pkg: &PartFs) -> Imag
     let [c1, c2] = colors[..] else {
         return kind;
     };
-    let (width, height, mut bytes, alpha) = match kind {
-        ImageKind::Jpeg { bytes, .. } => {
-            let Ok(img) = image::load_from_memory(&bytes) else {
-                return ImageKind::Reserve;
-            };
-            let rgb = img.to_rgb8();
-            (rgb.width(), rgb.height(), rgb.into_raw(), None)
-        }
-        ImageKind::Rgb {
-            width,
-            height,
-            bytes,
-            alpha,
-        } => (width, height, bytes, alpha),
-        other => return other,
+    let (width, height, mut bytes, alpha) = match raster_samples(kind) {
+        Ok(Some(samples)) => samples,
+        Ok(None) => return ImageKind::Reserve,
+        Err(other) => return other,
     };
     for px in bytes.as_chunks_mut::<3>().0 {
         let luma =
@@ -21494,17 +21460,77 @@ fn duotone_image(kind: ImageKind, dom: &Dom, blip: NodeId, pkg: &PartFs) -> Imag
     ImageKind::Rgb {
         width,
         height,
-        bytes,
-        alpha,
+        bytes: bytes.into(),
+        alpha: alpha.map(Into::into),
     }
 }
 
+/// The pictures one layout has decoded: by a hash of their bytes, each with
+/// its bytes (shared with a picture kept as its file) and what they decoded
+/// to (`None` for bytes that don't decode).
+type Decoded = HashMap<u64, Vec<(pdf::Pixels, Option<ImageKind>)>>;
+
+thread_local! {
+    /// The pictures decoded during one layout (`DecodedPictures`), by their
+    /// bytes: `None` outside a layout, where nothing is kept.
+    static DECODED: std::cell::RefCell<Option<Decoded>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Keeps each picture decoded once for the layout it is opened for, and lets
+/// them all go when it is dropped (restoring an enclosing layout's).
+struct DecodedPictures(Option<Decoded>);
+
+impl DecodedPictures {
+    fn open() -> Self {
+        Self(DECODED.with(|cell| cell.replace(Some(HashMap::new()))))
+    }
+}
+
+impl Drop for DecodedPictures {
+    fn drop(&mut self) {
+        let outer = self.0.take();
+        DECODED.with(|cell| *cell.borrow_mut() = outer);
+    }
+}
+
+/// A picture's kind from its bytes: decoded once per layout, then shared (an
+/// `ImageKind` clone shares its samples).
 fn decode_image(bytes: Vec<u8>) -> Option<ImageKind> {
-    if let Some((width, height, rgb, texts)) = metafile::render(&bytes) {
+    let key = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&bytes[..], &mut h);
+        std::hash::Hasher::finish(&h)
+    };
+    let cached = DECODED.with(|cell| {
+        cell.borrow().as_ref().map(|map| {
+            map.get(&key)
+                .and_then(|seen| seen.iter().find(|(b, _)| b[..] == bytes[..]))
+                .map(|(_, kind)| kind.clone())
+        })
+    });
+    match cached {
+        // Outside a layout: decode, keep nothing.
+        None => decode_image_once(&std::sync::Arc::new(bytes)),
+        Some(Some(kind)) => kind,
+        Some(None) => {
+            let bytes = std::sync::Arc::new(bytes);
+            let kind = decode_image_once(&bytes);
+            DECODED.with(|cell| {
+                if let Some(map) = cell.borrow_mut().as_mut() {
+                    map.entry(key).or_default().push((bytes, kind.clone()));
+                }
+            });
+            kind
+        }
+    }
+}
+
+fn decode_image_once(bytes: &pdf::Pixels) -> Option<ImageKind> {
+    if let Some((width, height, rgb, texts)) = metafile::render(bytes) {
         let raster = ImageKind::Rgb {
             width,
             height,
-            bytes: rgb,
+            bytes: rgb.into(),
             alpha: None,
         };
         if texts.is_empty() {
@@ -21518,32 +21544,46 @@ fn decode_image(bytes: Vec<u8>) -> Option<ImageKind> {
     if bytes.len() > 3
         && bytes[0] == 0xFF
         && bytes[1] == 0xD8
-        && let Some((width, height, components)) = jpeg_info(&bytes)
+        && let Some((width, height, components)) = jpeg_info(bytes)
     {
         // Word converts a CMYK photo to RGB for its PDF; embedded as
         // DeviceCMYK it renders far darker (fixtures_500 00feb732: 99% of
         // the photo under the ink threshold against Word's 64%).
         if components == 4
-            && let Ok(img) = image::load_from_memory(&bytes)
+            && let Ok(img) = image::load_from_memory(bytes)
         {
-            let rgb = img.to_rgb8();
+            let rgb = img.into_rgb8();
             return Some(ImageKind::Rgb {
                 width: rgb.width(),
                 height: rgb.height(),
-                bytes: rgb.into_raw(),
+                bytes: rgb.into_raw().into(),
                 alpha: None,
             });
         }
         return Some(ImageKind::Jpeg {
             width,
             height,
-            bytes,
+            bytes: bytes.clone(),
             components,
         });
     }
-    let img = image::load_from_memory(&bytes).ok()?;
+    // A PNG the PDF can take as it is: never decoded. One with transparency:
+    // decoded a row at a time into the samples and the mask, never as a whole
+    // RGBA image and a copy of it. Any other picture: the `image` crate.
+    if let Some(png) = png_pass::pass_through(bytes) {
+        return Some(ImageKind::Png(std::sync::Arc::new(png)));
+    }
+    if let Some((width, height, rgb, alpha)) = png_pass::rows_with_alpha(bytes) {
+        return Some(ImageKind::Rgb {
+            width,
+            height,
+            bytes: rgb.into(),
+            alpha: Some(alpha.into()),
+        });
+    }
+    let img = image::load_from_memory(bytes).ok()?;
     if img.color().has_alpha() {
-        let rgba = img.to_rgba8();
+        let rgba = img.into_rgba8();
         let (width, height) = (rgba.width(), rgba.height());
         let mut rgb = Vec::with_capacity((width * height * 3) as usize);
         let mut alpha = Vec::with_capacity((width * height) as usize);
@@ -21554,17 +21594,50 @@ fn decode_image(bytes: Vec<u8>) -> Option<ImageKind> {
         return Some(ImageKind::Rgb {
             width,
             height,
-            bytes: rgb,
-            alpha: Some(alpha),
+            bytes: rgb.into(),
+            alpha: Some(alpha.into()),
         });
     }
-    let rgb = img.to_rgb8();
+    let rgb = img.into_rgb8();
     Some(ImageKind::Rgb {
         width: rgb.width(),
         height: rgb.height(),
-        bytes: rgb.into_raw(),
+        bytes: rgb.into_raw().into(),
         alpha: None,
     })
+}
+
+/// A raster picture's width, height, RGB samples and alpha plane, owned.
+type Samples = (u32, u32, Vec<u8>, Option<Vec<u8>>);
+
+/// A raster picture's samples to change (an effect: washed out, soft edges,
+/// duotone), as owned RGB and alpha: a JPEG or a passed-through PNG is decoded
+/// here, and shared samples are copied, once, for the effect to write.
+/// `Err` hands back a picture that has no samples (a metafile, a shape);
+/// `Ok(None)` is a picture that can't be decoded.
+fn raster_samples(kind: ImageKind) -> Result<Option<Samples>, ImageKind> {
+    let decoded = |bytes: &[u8]| {
+        image::load_from_memory(bytes).ok().map(|img| {
+            let rgb = img.into_rgb8();
+            (rgb.width(), rgb.height(), rgb.into_raw(), None)
+        })
+    };
+    match kind {
+        ImageKind::Jpeg { bytes, .. } => Ok(decoded(&bytes)),
+        ImageKind::Png(png) => Ok(decoded(&png.source)),
+        ImageKind::Rgb {
+            width,
+            height,
+            bytes,
+            alpha,
+        } => Ok(Some((
+            width,
+            height,
+            bytes.to_vec(),
+            alpha.map(|a| a.to_vec()),
+        ))),
+        other => Err(other),
+    }
 }
 
 fn jpeg_info(data: &[u8]) -> Option<(u32, u32, u8)> {
@@ -29166,6 +29239,16 @@ impl<'a> Layout<'a> {
                 height: *height,
                 bytes: bytes.clone(),
                 alpha: alpha.clone(),
+                crop: img.crop,
+                rotate_deg: img.rotate_deg,
+                oval: img.oval,
+            }),
+            ImageKind::Png(png) => self.current().ops.push(Op::Png {
+                x,
+                y,
+                dw,
+                dh,
+                png: png.clone(),
                 crop: img.crop,
                 rotate_deg: img.rotate_deg,
                 oval: img.oval,
@@ -38122,7 +38205,8 @@ fn op_left(op: &Op) -> Option<f32> {
         | Op::FillRect { x, .. }
         | Op::StrokeRect { x, .. }
         | Op::Jpeg { x, .. }
-        | Op::Rgb { x, .. } => Some(*x),
+        | Op::Rgb { x, .. }
+        | Op::Png { x, .. } => Some(*x),
         Op::Line { x1, x2, .. } => Some(x1.min(*x2)),
         Op::FillPoly { points, .. } | Op::StrokePoly { points, .. } => {
             points.iter().map(|p| p.0).min_by(f32::total_cmp)
@@ -38251,7 +38335,8 @@ fn shift_op_y(op: &mut Op, dy: f32) {
         | Op::FillRect { y, .. }
         | Op::StrokeRect { y, .. }
         | Op::Jpeg { y, .. }
-        | Op::Rgb { y, .. } => {
+        | Op::Rgb { y, .. }
+        | Op::Png { y, .. } => {
             *y += dy;
         }
         Op::Line { y1, y2, .. } => {
@@ -38307,7 +38392,8 @@ fn shift_op_x(op: &mut Op, dx: f32) {
         | Op::FillRect { x, .. }
         | Op::StrokeRect { x, .. }
         | Op::Jpeg { x, .. }
-        | Op::Rgb { x, .. } => {
+        | Op::Rgb { x, .. }
+        | Op::Png { x, .. } => {
             *x += dx;
         }
         Op::Line { x1, x2, .. } => {
@@ -38356,7 +38442,7 @@ fn body_op_yrange(ops: &[Op]) -> Option<(f32, f32)> {
                 min_y = min_y.min(*y);
                 max_y = max_y.max(*y + *h);
             }
-            Op::Jpeg { y, dh, .. } | Op::Rgb { y, dh, .. } => {
+            Op::Jpeg { y, dh, .. } | Op::Rgb { y, dh, .. } | Op::Png { y, dh, .. } => {
                 min_y = min_y.min(*y);
                 max_y = max_y.max(*y + *dh);
             }
@@ -48118,8 +48204,8 @@ mod regression_tests {
                 panic!("{format:?} must decode as RGB");
             };
             assert_eq!((width, height), (2, 2), "{format:?}");
-            assert_eq!(bytes, pixels, "{format:?}");
-            assert!(alpha.is_none_or(|a| a == [255; 4]), "{format:?}");
+            assert_eq!(&bytes[..], &pixels[..], "{format:?}");
+            assert!(alpha.is_none_or(|a| a[..] == [255; 4]), "{format:?}");
         }
     }
 
@@ -48141,7 +48227,7 @@ mod regression_tests {
         };
         assert_eq!((width, height), (2, 1));
         assert_eq!(&bytes[..3], &[255, 0, 0]);
-        assert_eq!(alpha, Some(vec![255, 0]));
+        assert_eq!(alpha.as_deref().map(Vec::as_slice), Some(&[255, 0][..]));
     }
 
     #[test]
@@ -48156,8 +48242,8 @@ mod regression_tests {
         let image = ImageKind::Rgb {
             width: 2,
             height: 1,
-            bytes: vec![0, 100, 255, 50, 200, 128],
-            alpha: Some(vec![0, 128]),
+            bytes: vec![0, 100, 255, 50, 200, 128].into(),
+            alpha: Some(vec![0, 128].into()),
         };
         let ImageKind::Rgb {
             width,
@@ -48169,8 +48255,8 @@ mod regression_tests {
             panic!("washed image remains RGB");
         };
         assert_eq!((width, height), (2, 1));
-        assert_eq!(bytes, [207, 236, 255, 221, 255, 244]);
-        assert_eq!(alpha, Some(vec![0, 128]));
+        assert_eq!(&bytes[..], &[207, 236, 255, 221, 255, 244][..]);
+        assert_eq!(alpha.as_deref().map(Vec::as_slice), Some(&[0, 128][..]));
     }
 
     #[test]
@@ -48178,8 +48264,8 @@ mod regression_tests {
         let image = ImageKind::Rgb {
             width: 5,
             height: 5,
-            bytes: vec![42; 75],
-            alpha: Some(vec![128; 25]),
+            bytes: vec![42; 75].into(),
+            alpha: Some(vec![128; 25].into()),
         };
         let ImageKind::Rgb {
             width,
@@ -48191,14 +48277,14 @@ mod regression_tests {
             panic!("softened image remains RGB");
         };
         assert_eq!((width, height), (5, 5));
-        assert_eq!(bytes, vec![42; 75]);
+        assert_eq!(&bytes[..], &[42; 75][..]);
         let alpha = alpha.unwrap();
         assert_eq!(
-            alpha,
-            vec![
+            &alpha[..],
+            &[
                 32, 32, 32, 32, 32, 32, 96, 96, 96, 32, 32, 96, 128, 96, 32, 32, 96, 96, 96, 32,
                 32, 32, 32, 32, 32
-            ]
+            ][..]
         );
     }
 
@@ -48207,14 +48293,14 @@ mod regression_tests {
         let image = ImageKind::Rgb {
             width: 1,
             height: 1,
-            bytes: vec![1, 2, 3],
+            bytes: vec![1, 2, 3].into(),
             alpha: None,
         };
         let ImageKind::Rgb { bytes, alpha, .. } = soften_edges(image, 0.1, 0.1) else {
             panic!("softened image remains RGB");
         };
-        assert_eq!(bytes, [1, 2, 3]);
-        assert_eq!(alpha, Some(vec![128]));
+        assert_eq!(&bytes[..], &[1, 2, 3][..]);
+        assert_eq!(alpha.as_deref().map(Vec::as_slice), Some(&[128][..]));
     }
 
     #[test]
@@ -56187,7 +56273,7 @@ mod coverage_round_three_tests {
             img.kind = ImageKind::Rgb {
                 width: 1,
                 height: 1,
-                bytes: vec![255, 0, 0],
+                bytes: vec![255, 0, 0].into(),
                 alpha: None,
             };
             let mut run = TextRun::new(INLINE_PIC, Defaults::word().run);
@@ -56333,7 +56419,7 @@ mod coverage_round_three_tests {
                     image.kind = ImageKind::Jpeg {
                         width: 1,
                         height: 1,
-                        bytes: vec![],
+                        bytes: vec![].into(),
                         components: 3,
                     };
                 }
@@ -57619,8 +57705,8 @@ mod coverage_round_three_tests {
             img.kind = ImageKind::Rgb {
                 width: 1,
                 height: 1,
-                bytes: vec![10, 20, 30],
-                alpha: Some(vec![128]),
+                bytes: vec![10, 20, 30].into(),
+                alpha: Some(vec![128].into()),
             };
             img.inset = [1.0, 2.0, 3.0, 4.0];
             img.crop = Some([0.1, 0.2, 0.3, 0.1]);
@@ -57646,8 +57732,8 @@ mod coverage_round_three_tests {
             };
             assert_eq!((*x, *y, *dw, *dh), (11.0, 24.0, 96.0, 74.0));
             assert_eq!((*width, *height), (1, 1));
-            assert_eq!(bytes, &[10, 20, 30]);
-            assert_eq!(alpha.as_deref(), Some([128].as_slice()));
+            assert_eq!(&bytes[..], &[10, 20, 30]);
+            assert_eq!(alpha.as_deref().map(Vec::as_slice), Some([128].as_slice()));
             assert_eq!(*crop, img.crop);
             assert_eq!(*rotate_deg, 45.0);
             assert!(*oval);
@@ -57705,7 +57791,7 @@ mod coverage_round_three_tests {
             }
             assert_eq!(img.inset, [1.0, 2.0, 3.0, 4.0]);
             assert!(
-                matches!(&img.kind, ImageKind::Rgb { bytes, alpha: Some(alpha), .. } if bytes == &[10, 20, 30] && alpha == &[128])
+                matches!(&img.kind, ImageKind::Rgb { bytes, alpha: Some(alpha), .. } if bytes[..] == [10, 20, 30] && alpha[..] == [128])
             );
         }
 
@@ -57717,7 +57803,7 @@ mod coverage_round_three_tests {
             img.kind = ImageKind::Rgb {
                 width: 1,
                 height: 1,
-                bytes: vec![10, 20, 30],
+                bytes: vec![10, 20, 30].into(),
                 alpha: None,
             };
             img
@@ -57790,7 +57876,7 @@ mod coverage_round_three_tests {
                                 bytes,
                                 ..
                             } => {
-                                assert_eq!(bytes, &[10, 20, 30]);
+                                assert_eq!(&bytes[..], &[10, 20, 30]);
                                 Some((*x, *y, *dw, *dh))
                             }
                             _ => None,
@@ -59759,13 +59845,17 @@ mod rendering_uncovered_contract_tests {
                 panic!("{name}: WMF raster layer")
             };
             assert_eq!((*width, *height), (4, 4));
-            assert_eq!(bytes, &expected.repeat(16), "{name}");
+            assert_eq!(&bytes[..], &expected.repeat(16)[..], "{name}");
             let expected_alpha = soft.then(|| {
                 vec![
                     128, 128, 128, 128, 128, 255, 255, 128, 128, 255, 255, 128, 128, 128, 128, 128,
                 ]
             });
-            assert_eq!(alpha, &expected_alpha, "{name}");
+            assert_eq!(
+                alpha.as_deref().map(Vec::as_slice),
+                expected_alpha.as_deref(),
+                "{name}"
+            );
             let mut layout = Layout::new(&fonts, compact_page(), HfChrome::default(), 15);
             layout.emit_image_in(img, &Defaults::word().para);
             assert_eq!(layout.pages.len(), 1);
@@ -59965,7 +60055,7 @@ mod rendering_uncovered_contract_tests {
                                 let ImageKind::Rgb { bytes, .. } = raster.as_ref() else {
                                     panic!("WMF raster")
                                 };
-                                assert_eq!(bytes, &vec![0_u8; 48]);
+                                assert_eq!(&bytes[..], &[0_u8; 48][..]);
                             }
                             if kind == "textbox" {
                                 let box_ = &tail.boxes[0];
@@ -60112,7 +60202,7 @@ mod rendering_uncovered_contract_tests {
                             raster_ops.first()
                         {
                             assert_eq!((*x, *dw, *dh, *w, *h), (24.0, 40.0, 20.0, 4, 4));
-                            assert_eq!(*bytes, &vec![0_u8; 48]);
+                            assert_eq!(&bytes[..], &[0_u8; 48][..]);
                             assert_eq!(**alpha, None);
                             assert_eq!(*crop, None);
                             assert_eq!(*rot, 0.0);
@@ -60749,8 +60839,8 @@ mod rendering_uncovered_contract_tests {
         let source = ImageKind::Rgb {
             width: 3,
             height: 1,
-            bytes: vec![255, 0, 0, 0, 255, 0, 0, 0, 255],
-            alpha: Some(vec![0, 128, 255]),
+            bytes: vec![255, 0, 0, 0, 255, 0, 0, 0, 255].into(),
+            alpha: Some(vec![0, 128, 255].into()),
         };
         let ImageKind::Rgb {
             width,
@@ -60762,8 +60852,11 @@ mod rendering_uncovered_contract_tests {
             panic!("RGB retained")
         };
         assert_eq!((width, height), (3, 1));
-        assert_eq!(bytes, [54, 54, 54, 182, 182, 182, 18, 18, 18]);
-        assert_eq!(alpha, Some(vec![0, 128, 255]));
+        assert_eq!(&bytes[..], &[54, 54, 54, 182, 182, 182, 18, 18, 18][..]);
+        assert_eq!(
+            alpha.as_deref().map(Vec::as_slice),
+            Some(&[0, 128, 255][..])
+        );
     }
 
     #[test]
@@ -61891,13 +61984,16 @@ mod rendering_uncovered_contract_tests {
                 panic!("decoded memory PNG")
             };
             assert_eq!((*width, *height), (2, 2));
-            assert_eq!(bytes, &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
             assert_eq!(
-                alpha,
-                &Some(if soft {
-                    vec![128, 64, 32, 0]
+                &bytes[..],
+                &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
+            );
+            assert_eq!(
+                alpha.as_deref().map(Vec::as_slice),
+                Some(if soft {
+                    &[128, 64, 32, 0][..]
                 } else {
-                    vec![255, 128, 64, 0]
+                    &[255, 128, 64, 0][..]
                 })
             );
             let mut lay = Layout::new(&fonts, compact_page(), HfChrome::default(), 15);
@@ -64594,10 +64690,10 @@ mod rendering_uncovered_contract_tests {
                                 };
                                 assert_eq!((*width, *height), (2, 2));
                                 assert_eq!(
-                                    bytes.as_slice(),
+                                    &bytes[..],
                                     [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
                                 );
-                                assert_eq!(alpha.as_ref().unwrap().as_slice(), [255, 128, 64, 0]);
+                                assert_eq!(&alpha.as_ref().unwrap()[..], [255, 128, 64, 0]);
                             }
                             assert_eq!(dom.serialize_element(root), source);
                         }
@@ -67516,7 +67612,7 @@ mod encoded_picture_effect_contract_tests {
                 panic!("readable JPEG geometry retains the encoded source")
             };
             assert_eq!((width, height, actual), (5, 3, components));
-            assert_eq!(retained, unchanged);
+            assert_eq!(&retained[..], &unchanged[..]);
             assert_eq!(bytes, unchanged);
         }
     }
@@ -67581,8 +67677,8 @@ mod encoded_picture_effect_contract_tests {
             panic!("successful pixel effect retains an RGB image")
         };
         assert_eq!((width, height), (3, 3));
-        assert_eq!(bytes, expected_bytes);
-        assert_eq!(alpha.as_deref(), expected_alpha);
+        assert_eq!(&bytes[..], expected_bytes);
+        assert_eq!(alpha.as_deref().map(Vec::as_slice), expected_alpha);
     }
 
     #[test]

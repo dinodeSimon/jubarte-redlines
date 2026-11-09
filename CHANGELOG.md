@@ -17,6 +17,7 @@ See [docs/VERSIONING.md](docs/VERSIONING.md) for the release codemod and cross-r
 
 ### Fixed
 
+- A picture is held once while a document is drawn to PDF, not once for every place it appears and every copy made of it (refs #744, #710, #672). An opaque 8-bit PNG (gray, RGB or a palette), checked first for every chunk's CRC, its chunk order, every row's filter and the exact length of its image data, goes into the PDF as its own compressed image data with PNG predictors, never decoded; a PNG with transparency is decoded a row at a time into the image and its mask; each picture is decoded once per layout and its samples are shared, not copied, by every paint. On Jubarte's corpus (1,062 converting files, the WebAssembly build) the 99th percentile of memory fell from 98 MiB to 62 MiB and the most from 210 MiB to 96 MiB (a page scanned at 300 dpi: 148 MiB to 51 MiB); no file converts differently and none changes its page count. Every other picture takes the `image` crate's path as before.
 - The release script pauses mbx's automatic cache collection for the whole run and turns it back on when the run ends, failed or not. A collection in the middle of the 0.17.0 run removed the Python and WASM build directories (#2036).
 
 ## [0.17.0] - 2026-11-01

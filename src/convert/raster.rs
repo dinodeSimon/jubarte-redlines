@@ -397,6 +397,34 @@ fn paint_op<'f>(
                 );
             }
         }
+        // A passed-through PNG is decoded only here, where its pixels are drawn.
+        Op::Png {
+            x,
+            y,
+            dw,
+            dh,
+            png,
+            crop,
+            rotate_deg,
+            oval,
+        } => {
+            if let Ok(img) = image::load_from_memory(&png.source) {
+                let rgba = img.into_rgba8();
+                let place = Placement {
+                    rect: [*x, *y, *dw, *dh],
+                    crop: *crop,
+                    rotate_deg: *rotate_deg,
+                    oval: *oval,
+                };
+                paint_image(
+                    pixmap,
+                    (rgba.width(), rgba.height()),
+                    rgba.as_raw(),
+                    &place,
+                    ts,
+                );
+            }
+        }
         Op::Rgb {
             x,
             y,
@@ -824,7 +852,7 @@ mod tests {
                 dh: 50.0,
                 width: 2,
                 height: 2,
-                bytes: rgb,
+                bytes: rgb.into(),
                 alpha: None,
                 crop: Some([0.1, 0.1, 0.1, 0.1]),
                 rotate_deg: 30.0,
@@ -881,7 +909,7 @@ mod tests {
                 dh: 10.0,
                 width: 1,
                 height: 1,
-                bytes: vec![0, 1, 2],
+                bytes: vec![0, 1, 2].into(),
                 components: 3,
                 crop: None,
                 rotate_deg: 0.0,
@@ -1004,8 +1032,8 @@ mod raster_payload_boundary_tests {
                 dh: 20.0,
                 width: 2,
                 height: 1,
-                bytes: vec![255, 0, 0, 255, 0, 0],
-                alpha: alpha.clone(),
+                bytes: vec![255, 0, 0, 255, 0, 0].into(),
+                alpha: alpha.clone().map(Into::into),
                 crop: None,
                 rotate_deg: 0.0,
                 oval: false,
@@ -1038,7 +1066,7 @@ mod raster_payload_boundary_tests {
                 dh: 20.0,
                 width: 2,
                 height: 1,
-                bytes: vec![255, 0, 0],
+                bytes: vec![255, 0, 0].into(),
                 alpha: None,
                 crop: None,
                 rotate_deg: 0.0,
@@ -1322,7 +1350,7 @@ mod residual_display_contract_tests {
                 dh: 20.0,
                 width: 1,
                 height: 1,
-                bytes: bytes.clone(),
+                bytes: bytes.clone().into(),
                 components: 3,
                 crop: None,
                 rotate_deg: 0.0,
@@ -1331,7 +1359,7 @@ mod residual_display_contract_tests {
             paint_op(&mut p, &fonts, &mut faces, &op, Transform::identity());
             assert_eq!(p.data(), before);
             if let Op::Jpeg { bytes: after, .. } = op {
-                assert_eq!(after, bytes);
+                assert_eq!(&after[..], &bytes[..]);
             }
         }
     }
