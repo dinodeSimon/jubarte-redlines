@@ -16,6 +16,13 @@ use flate2::write::ZlibEncoder;
 use super::PdfOptions;
 use super::font::{FaceId, FaceRef, Fonts, word_device_paint, word_device_track};
 
+/// A picture's bytes, shared: the decoded pixels or the JPEG of one picture
+/// are held once however many times it is painted, as each paint operation
+/// and its layout record hold the same allocation rather than a copy. An
+/// `Arc<Vec<u8>>` rather than an `Arc<[u8]>`, because a `Vec` moves into it
+/// where a slice is copied (a page scan's samples would be held twice).
+pub(crate) type Pixels = std::sync::Arc<Vec<u8>>;
+
 /// One drawing command on a page (PDF user space, origin bottom-left).
 pub(crate) enum Op {
     Text {
@@ -100,7 +107,7 @@ pub(crate) enum Op {
         dh: f32,
         width: u32,
         height: u32,
-        bytes: Vec<u8>,
+        bytes: Pixels,
         components: u8,
         crop: Option<[f32; 4]>,
         rotate_deg: f32,
@@ -114,8 +121,20 @@ pub(crate) enum Op {
         dh: f32,
         width: u32,
         height: u32,
-        bytes: Vec<u8>,
-        alpha: Option<Vec<u8>>,
+        bytes: Pixels,
+        alpha: Option<Pixels>,
+        crop: Option<[f32; 4]>,
+        rotate_deg: f32,
+        oval: bool,
+    },
+    /// A PNG passed through undecoded (`png_pass`): its IDAT bytes become the
+    /// image stream, with PNG predictors.
+    Png {
+        x: f32,
+        y: f32,
+        dw: f32,
+        dh: f32,
+        png: std::sync::Arc<super::png_pass::PngPass>,
         crop: Option<[f32; 4]>,
         rotate_deg: f32,
         oval: bool,
@@ -313,6 +332,7 @@ impl Op {
             | Op::StrokeRect { y, .. }
             | Op::Jpeg { y, .. }
             | Op::Rgb { y, .. }
+            | Op::Png { y, .. }
             | Op::Watermark { y, .. } => *y += dy,
             Op::Line { y1, y2, .. } => {
                 *y1 += dy;
@@ -519,6 +539,8 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
     // The same samples repeat per page (a header logo): deflate them once.
     type RawImage<'p> = (u32, u32, &'p [u8], Option<&'p [u8]>);
     let mut rgb_ids: HashMap<u64, Vec<(RawImage<'_>, usize)>> = HashMap::new();
+    // A passed-through PNG drawn in many places is one object, matched by its file.
+    let mut png_ids: HashMap<u64, Vec<(&[u8], usize)>> = HashMap::new();
     let mut page_ids = Vec::new();
     for (page_idx, page) in pages.iter().enumerate() {
         let page_enc = &encodings[page_idx];
@@ -546,7 +568,8 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
                     ..
                 } => {
                     img_n += 1;
-                    let raw: RawImage<'_> = (*width, *height, bytes, alpha.as_deref());
+                    let raw: RawImage<'_> =
+                        (*width, *height, bytes, alpha.as_deref().map(Vec::as_slice));
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     raw.hash(&mut h);
                     let seen = rgb_ids.entry(h.finish()).or_default();
@@ -559,6 +582,22 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
                             let id =
                                 intern(&mut objs, rgb_xobject(*width, *height, bytes, true, smask));
                             seen.push((raw, id));
+                            id
+                        }
+                    };
+                    let _ = write!(xobjects, "/Im{img_n} {id} 0 R ");
+                }
+                Op::Png { png, .. } => {
+                    img_n += 1;
+                    let source: &[u8] = &png.source;
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    source.hash(&mut h);
+                    let seen = png_ids.entry(h.finish()).or_default();
+                    let id = match seen.iter().find(|(s, _)| *s == source) {
+                        Some((_, id)) => *id,
+                        None => {
+                            let id = intern(&mut objs, png_xobject(png));
+                            seen.push((source, id));
                             id
                         }
                     };
@@ -996,6 +1035,16 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
                     ..
                 }
                 | Op::Rgb {
+                    x,
+                    y,
+                    dw,
+                    dh,
+                    crop,
+                    rotate_deg,
+                    oval,
+                    ..
+                }
+                | Op::Png {
                     x,
                     y,
                     dw,
@@ -1821,6 +1870,37 @@ fn rgb_xobject(
     )
     .into_bytes();
     out.extend_from_slice(&bytes);
+    out.extend_from_slice(b"\nendstream");
+    out
+}
+
+/// A PNG's own compressed image data as an image XObject: `/FlateDecode`
+/// with the PNG predictors (`/Predictor 15`, each row's own filter), so the
+/// PDF reader undoes the row filters and nothing here decodes a pixel.
+fn png_xobject(png: &super::png_pass::PngPass) -> Vec<u8> {
+    use super::png_pass::PngColor;
+    let colorspace = match &png.color {
+        PngColor::Gray => "/DeviceGray".to_string(),
+        PngColor::Rgb => "/DeviceRGB".to_string(),
+        PngColor::Indexed(palette) => {
+            let mut hex = String::with_capacity(palette.len() * 2);
+            for b in palette {
+                let _ = write!(hex, "{b:02X}");
+            }
+            format!("[/Indexed /DeviceRGB {} <{hex}>]", palette.len() / 3 - 1)
+        }
+    };
+    let data = png.data();
+    let (width, height, colors) = (png.width, png.height, png.colors());
+    let mut out = format!(
+        "<< /Type /XObject /Subtype /Image /Width {width} /Height {height} \
+           /ColorSpace {colorspace} /BitsPerComponent 8 /Filter /FlateDecode \
+           /DecodeParms << /Predictor 15 /Colors {colors} /BitsPerComponent 8 /Columns {width} >> \
+           /Length {} >>\nstream\n",
+        data.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(&data);
     out.extend_from_slice(b"\nendstream");
     out
 }
@@ -2764,6 +2844,69 @@ mod residual_byte_and_geometry_contract_tests {
     }
 
     #[test]
+    fn png_xobjects_carry_the_files_own_image_data_with_png_predictors() {
+        // A 3 x 2 RGB PNG and a palette one, each as its file: the stream is the
+        // IDAT data joined, byte for byte, never re-encoded.
+        let file = |color_type: u8, plte: &[u8], rows: &[u8]| {
+            let chunk = |out: &mut Vec<u8>, kind: &[u8], data: &[u8]| {
+                out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                let mut crc = crc32fast::Hasher::new();
+                crc.update(kind);
+                crc.update(data);
+                out.extend_from_slice(&crc.finalize().to_be_bytes());
+            };
+            let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+            z.write_all(rows).unwrap();
+            let idat = z.finish().unwrap();
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            chunk(
+                &mut out,
+                b"IHDR",
+                &[0, 0, 0, 3, 0, 0, 0, 2, 8, color_type, 0, 0, 0],
+            );
+            if !plte.is_empty() {
+                chunk(&mut out, b"PLTE", plte);
+            }
+            chunk(&mut out, b"IDAT", &idat);
+            chunk(&mut out, b"IEND", &[]);
+            (out, idat)
+        };
+        let (rgb, rgb_idat) = file(
+            2,
+            &[],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        );
+        let png = super::super::png_pass::pass_through(&std::sync::Arc::new(rgb.clone())).unwrap();
+        let object = png_xobject(&png);
+        let at = object.windows(8).position(|w| w == b"\nstream\n").unwrap();
+        let dictionary = String::from_utf8_lossy(&object[..at]);
+        assert!(dictionary.contains(
+            "/Width 3 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode"
+        ));
+        assert!(
+            dictionary.contains(
+                "/DecodeParms << /Predictor 15 /Colors 3 /BitsPerComponent 8 /Columns 3 >>"
+            )
+        );
+        assert!(dictionary.contains(&format!("/Length {}", rgb_idat.len())));
+        assert_eq!(
+            &object[at + 8..object.len() - b"\nendstream".len()],
+            &rgb_idat[..]
+        );
+
+        let (indexed, _) = file(3, &[0, 0, 0, 255, 128, 0], &[0, 0, 1, 1, 0, 1, 0, 0]);
+        let png = super::super::png_pass::pass_through(&std::sync::Arc::new(indexed)).unwrap();
+        let object = png_xobject(&png);
+        let dictionary = String::from_utf8_lossy(
+            &object[..object.windows(8).position(|w| w == b"\nstream\n").unwrap()],
+        );
+        assert!(dictionary.contains("/ColorSpace [/Indexed /DeviceRGB 1 <000000FF8000>]"));
+        assert!(dictionary.contains("/Colors 1 /BitsPerComponent 8 /Columns 3"));
+    }
+
+    #[test]
     fn image_rotation_keeps_cardinal_matrices_and_subthreshold_rotation_is_identity() {
         let literal = "owned\n";
         for degrees in [-0.01, 0.0, 0.01] {
@@ -3120,7 +3263,7 @@ mod residual_byte_and_geometry_contract_tests {
                     dh: 10.0,
                     width: 3,
                     height: 1,
-                    bytes: jpeg.clone(),
+                    bytes: jpeg.clone().into(),
                     components: 3,
                     crop: None,
                     rotate_deg: 0.0,
@@ -3135,8 +3278,8 @@ mod residual_byte_and_geometry_contract_tests {
                     dh: 10.0,
                     width: 2,
                     height: 1,
-                    bytes: pixels.clone(),
-                    alpha: Some(alpha.clone()),
+                    bytes: pixels.clone().into(),
+                    alpha: Some(alpha.clone().into()),
                     crop: None,
                     rotate_deg: 0.0,
                     oval: false,
@@ -3261,14 +3404,17 @@ mod residual_byte_and_geometry_contract_tests {
         for page in pages {
             for (i, op) in page.ops.iter().enumerate() {
                 match op {
-                    Op::Jpeg { bytes, .. } => assert_eq!(bytes, &jpeg),
+                    Op::Jpeg { bytes, .. } => assert_eq!(&bytes[..], &jpeg[..]),
                     Op::Rgb {
                         bytes,
                         alpha: plane,
                         ..
                     } => {
-                        assert_eq!(bytes, if i == 2 { &pixels_a } else { &pixels_b });
-                        assert_eq!(plane.as_ref(), Some(&alpha));
+                        assert_eq!(
+                            &bytes[..],
+                            if i == 2 { &pixels_a[..] } else { &pixels_b[..] }
+                        );
+                        assert_eq!(plane.as_deref().map(Vec::as_slice), Some(&alpha[..]));
                     }
                     _ => panic!("authored image operation changed"),
                 }

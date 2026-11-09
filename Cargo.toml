@@ -167,6 +167,8 @@ unicode-segmentation = "1.13" # grapheme-safe anchor candidate excerpts
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] } # Mark / Symbol general categories for word tokens (`util::word_tokens`); already in the tree through rustybuzz
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif"] } # raster images in the PDF writer
 flate2 = "1.1" # optional `/FlateDecode` on PDF streams (already in the tree via zip/png, but a transitive dep is not usable directly)
+png = "0.18" # PNG pictures passed through to the PDF undecoded, or decoded a row at a time (`convert::png_pass`); already in the tree through image
+crc32fast = "1.5" # the PNG chunks' CRCs checked before a picture is passed through (`convert::png_pass`); already in the tree through flate2 and png
 quick-xml = "0.42" # checked XML admission (`xmllinq::parse::validate_xml`) before the permissive DOM parser
 # `OpcError::Xml`/`XmlAttr` (oxml-opc 0.14.4) carry quick-xml 0.41's error types,
 # and 0.42's (`QName` now wraps `&str`, new error paths) do not convert to them.
