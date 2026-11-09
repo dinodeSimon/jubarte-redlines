@@ -714,7 +714,11 @@ fn text_selection(
             pattern.to_string()
         };
         if pattern.len() > 1000 {
-            return Err(super::err("USAGE", None, "regex pattern is too long".to_string()));
+            return Err(super::err(
+                "USAGE",
+                None,
+                "regex pattern is too long".to_string(),
+            ));
         }
         let compiled = regex::RegexBuilder::new(&pattern)
             .size_limit(10 * 1024 * 1024)
