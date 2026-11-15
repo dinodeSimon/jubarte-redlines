@@ -45439,7 +45439,15 @@ fn a_duotone_picture_maps_its_luminance_between_the_two_colours() {
         let pdf = docx_to_pdf(&docx).expect("duotone");
         pdf_image_samples(&pdf)
             .into_iter()
-            .find(|s| s.len() == 3)
+            .find_map(|s| match s.len() {
+                // Decoded and painted: the pixel's three samples.
+                3 => Some(s),
+                // An opaque PNG passes through undecoded (its own data, with
+                // PNG predictors): one row of one pixel, its filter byte
+                // first. None (0) and Sub (1) leave a single pixel as it is.
+                4 if s[0] <= 1 => Some(s[1..].to_vec()),
+                _ => None,
+            })
             .expect("the 1x1 picture")
     };
     assert_eq!(paint(""), vec![255, 0, 0], "no duotone keeps the pixel");
