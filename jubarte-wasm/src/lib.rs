@@ -262,8 +262,12 @@ pub fn get_revisions(docx: &[u8], input_limits_json: Option<String>) -> Result<S
 /// (optional, default `false`) keeps only the pages a tracked change
 /// touches, the pages a comment is anchored on and each section's first
 /// page on which a revised header or footer paints (else the first page).
+/// `title` and `lang` (optional) are the PDF's `/Title` and `/Lang` instead
+/// of the file's own: its core title, and its default language (else its
+/// theme fonts' language), as Word's Save as PDF writes them.
 #[cfg(feature = "pdf")]
 #[wasm_bindgen(js_name = docxToPdf)]
+#[allow(clippy::too_many_arguments)]
 pub fn docx_to_pdf(
     docx: &[u8],
     compress: Option<bool>,
@@ -271,6 +275,8 @@ pub fn docx_to_pdf(
     revision_palette: Option<String>,
     move_comments: Option<bool>,
     changed_only: Option<bool>,
+    title: Option<String>,
+    lang: Option<String>,
 ) -> Result<Vec<u8>, JsValue> {
     let revisions = jubarte::convert::RevisionStyle::from_choice(
         revisions.as_deref().unwrap_or("conventional"),
@@ -288,7 +294,8 @@ pub fn docx_to_pdf(
         comment_notes: false,
         changed_only: changed_only.unwrap_or(false),
     };
-    jubarte::convert::docx_to_pdf_with(docx, options).map_err(js_err)
+    let info = jubarte::convert::PdfInfo { title, lang };
+    jubarte::convert::docx_to_pdf_with_info(docx, options, &info).map_err(js_err)
 }
 
 /// Number of pages in a PDF (cheap object scan; `0` if the bytes are not a
@@ -1944,11 +1951,11 @@ mod tests {
             .clean;
         let pages = |pdf: Vec<u8>| pdf_page_count(&pdf);
         assert_eq!(
-            pages(docx_to_pdf(&noted, None, None, None, None, None).unwrap()),
+            pages(docx_to_pdf(&noted, None, None, None, None, None, None, None).unwrap()),
             1
         );
         assert_eq!(
-            pages(docx_to_pdf(&noted, None, None, None, Some(true), None).unwrap()),
+            pages(docx_to_pdf(&noted, None, None, None, Some(true), None, None, None).unwrap()),
             2,
             "the comments are listed on a page after the last"
         );
@@ -1959,10 +1966,10 @@ mod tests {
             "Ann",
         )
         .unwrap();
-        let whole = pages(docx_to_pdf(&red, None, None, None, None, None).unwrap());
+        let whole = pages(docx_to_pdf(&red, None, None, None, None, None, None, None).unwrap());
         assert!(whole > 1, "{whole} pages");
         assert_eq!(
-            pages(docx_to_pdf(&red, None, None, None, None, Some(true)).unwrap()),
+            pages(docx_to_pdf(&red, None, None, None, None, Some(true), None, None).unwrap()),
             1
         );
     }

@@ -13,8 +13,8 @@ use std::io::Write;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
-use super::PdfOptions;
 use super::font::{FaceId, FaceRef, Fonts, word_device_paint, word_device_track};
+use super::{PdfInfo, PdfOptions};
 
 /// A picture's bytes, shared: the decoded pixels or the JPEG of one picture
 /// are held once however many times it is painted, as each paint operation
@@ -401,6 +401,7 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
     fonts: &Fonts,
     pages: &[P],
     options: PdfOptions,
+    info: &PdfInfo,
 ) -> Vec<u8> {
     let pages: Vec<&Page> = pages.iter().map(std::borrow::Borrow::borrow).collect();
     let pages = pages.as_slice();
@@ -1133,7 +1134,19 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
         );
     }
 
-    objs[0] = b"<< /Type /Catalog /Pages 2 0 R >>".to_vec();
+    // The document's language and title, as Word's Save as PDF writes them:
+    // a screen reader reads the text in `/Lang`, and a viewer shows the title,
+    // not the file name, in its title bar (`/DisplayDocTitle`).
+    let title = info.clean_title();
+    let mut catalog = String::from("<< /Type /Catalog /Pages 2 0 R");
+    if let Some(lang) = info.clean_lang() {
+        let _ = write!(catalog, " /Lang {}", pdf_text_string(lang));
+    }
+    if title.is_some() {
+        catalog.push_str(" /ViewerPreferences << /DisplayDocTitle true >>");
+    }
+    catalog.push_str(" >>");
+    objs[0] = catalog.into_bytes();
     let kids = page_ids
         .iter()
         .map(|id| format!("{id} 0 R"))
@@ -1144,7 +1157,14 @@ pub(crate) fn emit<P: std::borrow::Borrow<Page>>(
         n = page_ids.len()
     )
     .into_bytes();
-    objs[2] = b"<< /Producer (jubarte) /Creator (jubarte) >>".to_vec();
+    objs[2] = match &title {
+        Some(title) => format!(
+            "<< /Title {} /Producer (jubarte) /Creator (jubarte) >>",
+            pdf_text_string(title)
+        )
+        .into_bytes(),
+        None => b"<< /Producer (jubarte) /Creator (jubarte) >>".to_vec(),
+    };
     finalize_pdf(&objs)
 }
 
@@ -2405,7 +2425,7 @@ mod tests {
             comment_notes: true,
             ..crate::convert::PdfOptions::default()
         };
-        let pdf = super::emit(&fonts, &[page], options);
+        let pdf = super::emit(&fonts, &[page], options, &super::PdfInfo::default());
         let hay = String::from_utf8_lossy(&pdf);
         // X = y, Y = width − x: [700, 595.2 − 120] to [714, 595.2 − 100].
         assert!(
@@ -3091,6 +3111,7 @@ mod residual_byte_and_geometry_contract_tests {
                             compress,
                             ..PdfOptions::default()
                         },
+                        &PdfInfo::default(),
                     );
                     let xref = pdf.windows(6).rposition(|w| w == b"\nxref\n").unwrap() + 1;
                     let tail = std::str::from_utf8(&pdf[xref..]).unwrap();
@@ -3200,7 +3221,12 @@ mod residual_byte_and_geometry_contract_tests {
             )
             .hidden(),
         );
-        let pdf = emit(&fonts, std::slice::from_ref(&page), PdfOptions::default());
+        let pdf = emit(
+            &fonts,
+            std::slice::from_ref(&page),
+            PdfOptions::default(),
+            &PdfInfo::default(),
+        );
         let pdf = String::from_utf8_lossy(&pdf);
         assert!(
             pdf.contains("/Span <</ActualText <FEFF78147A76>>> BDC <00000000> Tj EMC"),
@@ -3226,7 +3252,12 @@ mod residual_byte_and_geometry_contract_tests {
             [0.0, 0.0, 0.0],
             "\u{1D44E}".to_string(),
         ));
-        let pdf = emit(&fonts, std::slice::from_ref(&page), PdfOptions::default());
+        let pdf = emit(
+            &fonts,
+            std::slice::from_ref(&page),
+            PdfOptions::default(),
+            &PdfInfo::default(),
+        );
         let pdf = String::from_utf8_lossy(&pdf);
         assert!(
             pdf.contains(&format!(
@@ -3295,6 +3326,7 @@ mod residual_byte_and_geometry_contract_tests {
                     compress,
                     ..PdfOptions::default()
                 },
+                &PdfInfo::default(),
             );
             // Decode actual object boundaries through the writer's xref offsets;
             // binary image/font streams must never be parsed as text objects.

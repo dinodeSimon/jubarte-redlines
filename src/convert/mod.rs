@@ -35,6 +35,7 @@ pub(crate) mod altchunk;
 mod diff_render;
 mod font;
 mod font_table;
+mod info;
 mod math_font;
 mod math_layout;
 mod metafile;
@@ -62,6 +63,7 @@ use font::{Face, FaceId, FaceRef, Fonts, NO_BREAK_HYPHEN};
 
 pub use diff_render::{DiffOptions, PageDiff, RenderDiff, diff_render};
 pub use font::{FontReportEntry, FontStep, font_report_json};
+pub use info::PdfInfo;
 
 /// The bundled catalogue faces alone (metric twins of Word's: Carlito for
 /// Calibri, Liberation for Arial and Times). Chrome parts load before the
@@ -439,7 +441,26 @@ pub fn docx_to_pdf(docx: &[u8]) -> Result<Vec<u8>, ConvertError> {
 ///   document part;
 /// - [`ConvertError::Emit`] when the PDF object assembly fails.
 pub fn docx_to_pdf_with(docx: &[u8], options: PdfOptions) -> Result<Vec<u8>, ConvertError> {
-    Ok(docx_to_pdf_report(docx, options)?.pdf)
+    docx_to_pdf_with_info(docx, options, &PdfInfo::default())
+}
+
+/// [`docx_to_pdf_with`], with the PDF's title and language given: each one
+/// `info` sets is written instead of the file's own (its core title, and its
+/// default language). The PDF writes the title as `/Info /Title`, shown in
+/// the viewer's title bar (`/DisplayDocTitle`), and the language as
+/// `/Catalog /Lang`, as Word's Save as PDF does.
+///
+/// # Errors
+///
+/// As [`docx_to_pdf_with`].
+pub fn docx_to_pdf_with_info(
+    docx: &[u8],
+    options: PdfOptions,
+    info: &PdfInfo,
+) -> Result<Vec<u8>, ConvertError> {
+    let (result, _) =
+        font::with_font_report(|| with_options(options, || docx_to_pdf_body(docx, options, info)));
+    result
 }
 
 /// Render a DOCX package to PDF and return the font-resolution report for
@@ -458,11 +479,24 @@ pub fn docx_to_pdf_report(docx: &[u8], options: PdfOptions) -> Result<ConvertedP
 }
 
 fn docx_to_pdf_inner(docx: &[u8], options: PdfOptions) -> Result<Vec<u8>, ConvertError> {
-    with_options(options, || docx_to_pdf_body(docx, options))
+    with_options(options, || {
+        docx_to_pdf_body(docx, options, &PdfInfo::default())
+    })
 }
 
-fn docx_to_pdf_body(docx: &[u8], options: PdfOptions) -> Result<Vec<u8>, ConvertError> {
-    with_pages(docx, |fonts, pages| pdf::emit(fonts, pages, options))
+fn docx_to_pdf_body(
+    docx: &[u8],
+    options: PdfOptions,
+    given: &PdfInfo,
+) -> Result<Vec<u8>, ConvertError> {
+    with_layout(docx, |fonts, pages, facts| {
+        pdf::emit(
+            fonts,
+            pages,
+            options,
+            &facts.info.clone().overridden_by(given),
+        )
+    })
 }
 
 /// Text painted on one page, in paint order (header first when present).
@@ -619,8 +653,8 @@ pub fn render(
                     .into_iter()
                     .map(|i| &pages[i])
                     .collect();
-                let pdf =
-                    (want_pdf && !written.is_empty()).then(|| pdf::emit(fonts, &written, options));
+                let pdf = (want_pdf && !written.is_empty())
+                    .then(|| pdf::emit(fonts, &written, options, &facts.info));
                 let pngs: Vec<Vec<u8>> = match png_dpi {
                     Some(dpi) => written
                         .iter()
@@ -750,6 +784,8 @@ pub(crate) struct LayoutFacts {
     /// Bookmark name to the page label a `PAGEREF` to it shows (the section's
     /// number format and chapter prefix applied, so "iii" or "2-1").
     pub(crate) bookmark_pages: BTreeMap<String, String>,
+    /// The PDF's title and language, from the package's own parts.
+    pub(crate) info: PdfInfo,
 }
 
 /// Lay `docx` out as the default convert does and report its page facts.
@@ -762,15 +798,7 @@ pub(crate) fn layout_facts(docx: &[u8]) -> Result<LayoutFacts, ConvertError> {
 }
 
 /// The shared layout pipeline: open, resolve fonts, lay out, then hand the
-/// pages to `emit`.
-fn with_pages<T>(
-    docx: &[u8],
-    emit: impl FnOnce(&Fonts, &[pdf::Page]) -> T,
-) -> Result<T, ConvertError> {
-    with_layout(docx, |fonts, pages, _| emit(fonts, pages))
-}
-
-/// [`with_pages`] that also hands `emit` the layout's page facts.
+/// pages and the layout's page facts to `emit`.
 fn with_layout<T>(
     docx: &[u8],
     emit: impl FnOnce(&Fonts, &[pdf::Page], &LayoutFacts) -> T,
@@ -951,8 +979,9 @@ fn with_layout<T>(
                 display,
                 separator,
             };
-            let (mut pages, facts) =
+            let (mut pages, mut facts) =
                 layout_with_facts(&fonts, &page, &hf, &blocks, compat_mode, footnotes);
+            facts.info = PdfInfo::of_package(&pkg);
             for (i, page) in pages.iter_mut().enumerate() {
                 page.number = i + 1;
             }
@@ -35911,6 +35940,7 @@ fn layout_with_facts(
         bookmark_pages: std::mem::take(&mut lay.bookmark_pages)
             .into_iter()
             .collect(),
+        info: PdfInfo::default(),
     };
     (lay.pages, facts)
 }
